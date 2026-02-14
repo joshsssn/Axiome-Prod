@@ -30,13 +30,14 @@ A professional-grade financial portfolio management, analytics, and strategy opt
 ### Quick Start
 
 1. **Clone the repository**:
+
    ```bash
    git clone https://github.com/your-username/ECE-Tracking-Plateforme.git
    cd ECE-Tracking-Plateforme
    ```
-
 2. **Configure Environment**:
    Create a `.env` file in the root directory (use standard Postgres/Redis settings):
+
    ```env
    POSTGRES_USER=postgres
    POSTGRES_PASSWORD=postgres
@@ -44,17 +45,18 @@ A professional-grade financial portfolio management, analytics, and strategy opt
    POSTGRES_SERVER=db
    POSTGRES_PORT=5432
    ```
-
 3. **Launch the platform**:
+
    ```bash
    docker-compose up --build
    ```
-
 4. **Access the application**:
+
    - **Frontend**: [http://localhost:5173](http://localhost:5173)
    - **API Docs (Swagger)**: [http://localhost:8000/docs](http://localhost:8000/docs)
 
 ### Default Credentials
+
 - **Username**: `admin`
 - **Password**: `admin`
 
@@ -69,4 +71,5 @@ A professional-grade financial portfolio management, analytics, and strategy opt
 MIT
 
 ---
-Build with ❤️ for ECE Portfolio Management, by Josh E. SOUSSAN
+
+Build with ❤️ for ECE Portfolio Management team, by Josh E. SOUSSAN
