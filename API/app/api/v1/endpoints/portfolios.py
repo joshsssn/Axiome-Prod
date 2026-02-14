@@ -1,0 +1,503 @@
+from typing import List, Any
+from datetime import date
+from fastapi import APIRouter, Depends, HTTPException, status
+from sqlalchemy.orm import Session
+
+from app import models, schemas
+from app.api import deps
+from app.models.portfolio import Portfolio, Position, Transaction, Collaborator
+from app.services.market_data import MarketDataService
+
+router = APIRouter()
+
+# ========== PORTFOLIO CRUD ==========
+
+@router.get("/", response_model=List[schemas.portfolio.Portfolio])
+def read_portfolios(
+    db: Session = Depends(deps.get_db),
+    current_user: models.User = Depends(deps.get_current_active_user),
+    skip: int = 0,
+    limit: int = 100,
+) -> Any:
+    """Retrieve portfolios owned by user or shared with user."""
+    owned = db.query(Portfolio).filter(Portfolio.owner_id == current_user.id).offset(skip).limit(limit).all()
+    # Also include shared portfolios
+    shared_collabs = db.query(Collaborator).filter(Collaborator.user_id == current_user.id).all()
+    shared_ids = [c.portfolio_id for c in shared_collabs]
+    shared = db.query(Portfolio).filter(Portfolio.id.in_(shared_ids)).all() if shared_ids else []
+    all_portfolios = owned + [p for p in shared if p not in owned]
+    return all_portfolios
+
+@router.post("/", response_model=schemas.portfolio.Portfolio)
+def create_portfolio(
+    *,
+    db: Session = Depends(deps.get_db),
+    portfolio_in: schemas.portfolio.PortfolioCreate,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Create new portfolio."""
+    portfolio = Portfolio(
+        **portfolio_in.model_dump(),
+        owner_id=current_user.id
+    )
+    db.add(portfolio)
+    db.commit()
+    db.refresh(portfolio)
+    return portfolio
+
+@router.get("/{id}", response_model=schemas.portfolio.PortfolioFull)
+def read_portfolio(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Get portfolio by ID with enriched positions, transactions, and collaborators."""
+    portfolio = _get_portfolio_with_access(db, id, current_user)
+
+    md_service = MarketDataService(db)
+
+    # Sync instruments so we have fresh metadata (name, sector, price)
+    synced: dict = {}
+    for p in portfolio.positions:
+        sym = p.instrument_symbol
+        if sym not in synced:
+            try:
+                synced[sym] = md_service.sync_instrument(sym)
+            except Exception:
+                synced[sym] = p.instrument
+
+    # Enrich positions
+    enriched_positions = []
+    total_value = 0.0
+    for p in portfolio.positions:
+        inst = synced.get(p.instrument_symbol) or p.instrument
+        if p.pricing_mode == 'market' and inst and inst.current_price:
+            cp = inst.current_price
+        elif p.current_price:
+            cp = p.current_price
+        else:
+            cp = p.entry_price
+        val = p.quantity * cp
+        total_value += val
+        enriched_positions.append({
+            "id": p.id,
+            "portfolio_id": p.portfolio_id,
+            "instrument_symbol": p.instrument_symbol,
+            "quantity": p.quantity,
+            "entry_price": p.entry_price,
+            "entry_date": p.entry_date,
+            "pricing_mode": p.pricing_mode,
+            "current_price": cp,
+            "name": (inst.name if inst and inst.name else p.instrument_symbol),
+            "asset_class": (inst.asset_class if inst and inst.asset_class else "Equity"),
+            "sector": (inst.sector if inst and inst.sector else "Other"),
+            "country": (inst.country if inst and inst.country else "US"),
+            "currency": (inst.currency if inst and inst.currency else portfolio.currency),
+        })
+
+    # Calculate weights, pnl, daily_change
+    for ep in enriched_positions:
+        mkt_val = ep["quantity"] * ep["current_price"]
+        ep["weight"] = round((mkt_val / total_value * 100) if total_value > 0 else 0, 2)
+        ep["pnl"] = round((ep["current_price"] - ep["entry_price"]) * ep["quantity"], 2)
+        cost = ep["entry_price"] * ep["quantity"]
+        ep["pnl_percent"] = round(((ep["current_price"] - ep["entry_price"]) / ep["entry_price"] * 100) if ep["entry_price"] > 0 else 0, 2)
+        ep["daily_change"] = 0.0  # Will be computed by analytics if needed
+
+    # Enrich collaborators with username/email
+    enriched_collabs = []
+    for c in portfolio.collaborators:
+        user = db.query(models.User).filter(models.User.id == c.user_id).first()
+        enriched_collabs.append({
+            "id": c.id,
+            "portfolio_id": c.portfolio_id,
+            "user_id": c.user_id,
+            "permission": c.permission,
+            "added_date": c.added_date,
+            "username": user.username if user else "",
+            "email": user.email if user else "",
+        })
+
+    # Build summary
+    total_cost = sum(ep["entry_price"] * ep["quantity"] for ep in enriched_positions)
+    total_pnl = total_value - total_cost
+    summary = {
+        "name": portfolio.name,
+        "description": portfolio.description or "",
+        "currency": portfolio.currency,
+        "benchmark": portfolio.benchmark_symbol or "SPY",
+        "totalValue": round(total_value, 2),
+        "dailyPnl": 0,
+        "dailyPnlPercent": 0,
+        "totalPnl": round(total_pnl, 2),
+        "totalPnlPercent": round((total_pnl / total_cost * 100) if total_cost > 0 else 0, 2),
+        "positionCount": len(enriched_positions),
+        "cashBalance": 0,
+        "inceptionDate": str(min((ep["entry_date"] for ep in enriched_positions), default="2024-01-01")),
+    }
+
+    return {
+        "id": portfolio.id,
+        "owner_id": portfolio.owner_id,
+        "name": portfolio.name,
+        "description": portfolio.description,
+        "currency": portfolio.currency,
+        "benchmark_symbol": portfolio.benchmark_symbol,
+        "positions": enriched_positions,
+        "transactions": [_tx_to_dict(t) for t in sorted(portfolio.transactions, key=lambda t: t.date, reverse=True)],
+        "collaborators": enriched_collabs,
+        "summary": summary,
+    }
+
+@router.put("/{id}", response_model=schemas.portfolio.Portfolio)
+def update_portfolio(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    portfolio_in: schemas.portfolio.PortfolioUpdate,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Update portfolio metadata."""
+    portfolio = db.query(Portfolio).filter(Portfolio.id == id, Portfolio.owner_id == current_user.id).first()
+    if not portfolio:
+        raise HTTPException(status_code=404, detail="Portfolio not found")
+    update_data = portfolio_in.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(portfolio, field, value)
+    db.commit()
+    db.refresh(portfolio)
+    return portfolio
+
+@router.delete("/{id}")
+def delete_portfolio(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Delete portfolio."""
+    portfolio = db.query(Portfolio).filter(Portfolio.id == id, Portfolio.owner_id == current_user.id).first()
+    if not portfolio:
+        raise HTTPException(status_code=404, detail="Portfolio not found")
+    db.delete(portfolio)
+    db.commit()
+    return {"ok": True}
+
+@router.post("/{id}/duplicate", response_model=schemas.portfolio.Portfolio)
+def duplicate_portfolio(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Duplicate a portfolio."""
+    source = _get_portfolio_with_access(db, id, current_user)
+    new_portfolio = Portfolio(
+        name=f"{source.name} (Copy)",
+        description=source.description,
+        currency=source.currency,
+        benchmark_symbol=source.benchmark_symbol,
+        owner_id=current_user.id,
+    )
+    db.add(new_portfolio)
+    db.flush()
+    # Copy positions
+    for p in source.positions:
+        new_pos = Position(
+            portfolio_id=new_portfolio.id,
+            instrument_symbol=p.instrument_symbol,
+            quantity=p.quantity,
+            entry_price=p.entry_price,
+            entry_date=p.entry_date,
+            pricing_mode=p.pricing_mode,
+            current_price=p.current_price,
+        )
+        db.add(new_pos)
+    # Copy transactions
+    for t in source.transactions:
+        new_tx = Transaction(
+            portfolio_id=new_portfolio.id,
+            date=t.date,
+            type=t.type,
+            symbol=t.symbol,
+            name=t.name,
+            quantity=t.quantity,
+            price=t.price,
+            total=t.total,
+            currency=t.currency,
+            notes=t.notes,
+        )
+        db.add(new_tx)
+    db.commit()
+    db.refresh(new_portfolio)
+    return new_portfolio
+
+# ========== POSITIONS ==========
+
+@router.post("/{id}/positions", response_model=schemas.portfolio.Position)
+def create_position(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    position_in: schemas.portfolio.PositionCreate,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Add a position to a portfolio."""
+    portfolio = _get_portfolio_with_access(db, id, current_user, need_edit=True)
+
+    # Sync instrument data
+    md_service = MarketDataService(db)
+    instrument = md_service.sync_instrument(position_in.instrument_symbol)
+
+    if not instrument:
+        instrument = models.instrument.Instrument(
+            symbol=position_in.instrument_symbol,
+            name=position_in.instrument_symbol,
+            last_updated=None
+        )
+        db.add(instrument)
+        db.commit()
+
+    position = Position(
+        portfolio_id=portfolio.id,
+        instrument_symbol=position_in.instrument_symbol,
+        quantity=position_in.quantity,
+        entry_price=position_in.entry_price,
+        entry_date=position_in.entry_date,
+        pricing_mode=position_in.pricing_mode,
+        current_price=position_in.current_price or (instrument.current_price if instrument else position_in.entry_price),
+    )
+    db.add(position)
+    db.commit()
+    db.refresh(position)
+    return position
+
+@router.put("/{id}/positions/{pos_id}", response_model=schemas.portfolio.Position)
+def update_position(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    pos_id: int,
+    position_in: schemas.portfolio.PositionUpdate,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Update a position."""
+    _get_portfolio_with_access(db, id, current_user, need_edit=True)
+    position = db.query(Position).filter(Position.id == pos_id, Position.portfolio_id == id).first()
+    if not position:
+        raise HTTPException(status_code=404, detail="Position not found")
+    update_data = position_in.model_dump(exclude_unset=True)
+    for field, value in update_data.items():
+        setattr(position, field, value)
+    db.commit()
+    db.refresh(position)
+    return position
+
+@router.delete("/{id}/positions/{pos_id}")
+def delete_position(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    pos_id: int,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Remove a position."""
+    _get_portfolio_with_access(db, id, current_user, need_edit=True)
+    position = db.query(Position).filter(Position.id == pos_id, Position.portfolio_id == id).first()
+    if not position:
+        raise HTTPException(status_code=404, detail="Position not found")
+    db.delete(position)
+    db.commit()
+    return {"ok": True}
+
+# ========== TRANSACTIONS ==========
+
+@router.get("/{id}/transactions", response_model=List[schemas.portfolio.Transaction])
+def list_transactions(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """List portfolio transactions."""
+    _get_portfolio_with_access(db, id, current_user)
+    txs = db.query(Transaction).filter(Transaction.portfolio_id == id).order_by(Transaction.date.desc()).all()
+    return txs
+
+@router.post("/{id}/transactions", response_model=schemas.portfolio.Transaction)
+def create_transaction(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    tx_in: schemas.portfolio.TransactionCreate,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Add a transaction."""
+    _get_portfolio_with_access(db, id, current_user, need_edit=True)
+    tx = Transaction(
+        portfolio_id=id,
+        **tx_in.model_dump(),
+    )
+    db.add(tx)
+    db.commit()
+    db.refresh(tx)
+    return tx
+
+@router.delete("/{id}/transactions/{tx_id}")
+def delete_transaction(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    tx_id: int,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Delete a transaction."""
+    _get_portfolio_with_access(db, id, current_user, need_edit=True)
+    tx = db.query(Transaction).filter(Transaction.id == tx_id, Transaction.portfolio_id == id).first()
+    if not tx:
+        raise HTTPException(status_code=404, detail="Transaction not found")
+    db.delete(tx)
+    db.commit()
+    return {"ok": True}
+
+# ========== COLLABORATORS ==========
+
+@router.get("/{id}/collaborators", response_model=List[schemas.portfolio.Collaborator])
+def list_collaborators(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """List collaborators."""
+    _get_portfolio_with_access(db, id, current_user)
+    collabs = db.query(Collaborator).filter(Collaborator.portfolio_id == id).all()
+    result = []
+    for c in collabs:
+        user = db.query(models.User).filter(models.User.id == c.user_id).first()
+        result.append({
+            "id": c.id,
+            "portfolio_id": c.portfolio_id,
+            "user_id": c.user_id,
+            "permission": c.permission,
+            "added_date": c.added_date,
+            "username": user.username if user else "",
+            "email": user.email if user else "",
+        })
+    return result
+
+@router.post("/{id}/collaborators", response_model=schemas.portfolio.Collaborator)
+def add_collaborator(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    collab_in: schemas.portfolio.CollaboratorCreate,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Add a collaborator (owner only)."""
+    portfolio = db.query(Portfolio).filter(Portfolio.id == id, Portfolio.owner_id == current_user.id).first()
+    if not portfolio:
+        raise HTTPException(status_code=403, detail="Only the owner can add collaborators")
+    # Check user exists
+    target_user = db.query(models.User).filter(models.User.id == collab_in.user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+    # Check not already collaborator
+    existing = db.query(Collaborator).filter(
+        Collaborator.portfolio_id == id, Collaborator.user_id == collab_in.user_id
+    ).first()
+    if existing:
+        raise HTTPException(status_code=400, detail="User is already a collaborator")
+    collab = Collaborator(
+        portfolio_id=id,
+        user_id=collab_in.user_id,
+        permission=collab_in.permission,
+        added_date=date.today(),
+    )
+    db.add(collab)
+    db.commit()
+    db.refresh(collab)
+    return {
+        "id": collab.id,
+        "portfolio_id": collab.portfolio_id,
+        "user_id": collab.user_id,
+        "permission": collab.permission,
+        "added_date": collab.added_date,
+        "username": target_user.username,
+        "email": target_user.email,
+    }
+
+@router.put("/{id}/collaborators/{collab_id}")
+def update_collaborator(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    collab_id: int,
+    collab_in: schemas.portfolio.CollaboratorUpdate,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Update collaborator permission (owner only)."""
+    portfolio = db.query(Portfolio).filter(Portfolio.id == id, Portfolio.owner_id == current_user.id).first()
+    if not portfolio:
+        raise HTTPException(status_code=403, detail="Only the owner can update collaborators")
+    collab = db.query(Collaborator).filter(Collaborator.id == collab_id, Collaborator.portfolio_id == id).first()
+    if not collab:
+        raise HTTPException(status_code=404, detail="Collaborator not found")
+    collab.permission = collab_in.permission
+    db.commit()
+    return {"ok": True}
+
+@router.delete("/{id}/collaborators/{collab_id}")
+def remove_collaborator(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    collab_id: int,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """Remove a collaborator (owner only)."""
+    portfolio = db.query(Portfolio).filter(Portfolio.id == id, Portfolio.owner_id == current_user.id).first()
+    if not portfolio:
+        raise HTTPException(status_code=403, detail="Only the owner can remove collaborators")
+    collab = db.query(Collaborator).filter(Collaborator.id == collab_id, Collaborator.portfolio_id == id).first()
+    if not collab:
+        raise HTTPException(status_code=404, detail="Collaborator not found")
+    db.delete(collab)
+    db.commit()
+    return {"ok": True}
+
+# ========== HELPERS ==========
+
+def _get_portfolio_with_access(db: Session, portfolio_id: int, user: models.User, need_edit: bool = False) -> Portfolio:
+    """Get portfolio checking owner or collaborator access."""
+    portfolio = db.query(Portfolio).filter(Portfolio.id == portfolio_id).first()
+    if not portfolio:
+        raise HTTPException(status_code=404, detail="Portfolio not found")
+    if portfolio.owner_id == user.id:
+        return portfolio
+    # Check collaborator access
+    collab = db.query(Collaborator).filter(
+        Collaborator.portfolio_id == portfolio_id,
+        Collaborator.user_id == user.id
+    ).first()
+    if not collab:
+        raise HTTPException(status_code=404, detail="Portfolio not found")
+    if need_edit and collab.permission != 'edit':
+        raise HTTPException(status_code=403, detail="You don't have edit permission")
+    return portfolio
+
+def _tx_to_dict(t: Transaction) -> dict:
+    return {
+        "id": t.id,
+        "portfolio_id": t.portfolio_id,
+        "date": t.date,
+        "type": t.type,
+        "symbol": t.symbol,
+        "name": t.name,
+        "quantity": t.quantity,
+        "price": t.price,
+        "total": t.total,
+        "currency": t.currency,
+        "notes": t.notes,
+    }

@@ -1,0 +1,40 @@
+from typing import Any
+from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy.orm import Session
+
+from app import models, schemas
+from app.api import deps
+from app.models.portfolio import Portfolio, Collaborator
+from app.services.analytics import AnalyticsService
+
+router = APIRouter()
+
+@router.get("/{id}/analytics", response_model=schemas.analytics.PortfolioAnalytics)
+def get_portfolio_analytics(
+    *,
+    db: Session = Depends(deps.get_db),
+    id: int,
+    current_user: models.User = Depends(deps.get_current_active_user),
+) -> Any:
+    """
+    Get portfolio analytics (performance, risk metrics, allocation).
+    """
+    portfolio = db.query(Portfolio).filter(Portfolio.id == id).first()
+    if not portfolio:
+        raise HTTPException(status_code=404, detail="Portfolio not found")
+    # Check access: owner or collaborator
+    if portfolio.owner_id != current_user.id:
+        collab = db.query(Collaborator).filter(
+            Collaborator.portfolio_id == id,
+            Collaborator.user_id == current_user.id,
+        ).first()
+        if not collab:
+            raise HTTPException(status_code=403, detail="Access denied")
+
+    analytics_service = AnalyticsService(db)
+    try:
+        data = analytics_service.get_portfolio_analytics(portfolio)
+        return data
+    except Exception as e:
+        print(f"Analytics Error: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
