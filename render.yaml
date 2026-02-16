@@ -72,20 +72,17 @@ services:
           name: portfolio-api
           envVarKey: RENDER_EXTERNAL_URL
 
-databases:
-  - name: portfolio-db
-    databaseName: portfolio_db
-    user: postgres
-    plan: free # 90 days limit on free tier, upgrade for persistence
-
-# Redis instance (requires paid plan or starter, if free plan needed use external redis)
-# Note: Render Redis Free tier is not available in Blueprint yet or expires.
-# If on free plan, you might need to use a managed Redis (like Upstash) and set REDIS_URL manually.
-# For now, we define it as a service assuming a plan that supports it or standard Redis.
-services:
+  # --------------------------------------------------------------------------------
+  # REDIS SERVICE
+  # --------------------------------------------------------------------------------
   - type: redis
     name: portfolio-redis
     region: oregon
     plan: free # check availability
     ipAllowList: [] # internal only
 
+databases:
+  - name: portfolio-db
+    databaseName: portfolio_db
+    user: postgres
+    plan: free # 90 days limit on free tier, upgrade for persistence
