@@ -84,5 +84,5 @@ services:
 databases:
   - name: portfolio-db
     databaseName: portfolio_db
-    user: postgres
+    user: axiome_user
     plan: free # 90 days limit on free tier, upgrade for persistence
