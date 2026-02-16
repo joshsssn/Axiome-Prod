@@ -38,21 +38,25 @@ def startup_event():
     init_db(db)
     db.close()
 
-    # Temporary: Force reset admin password
-    from app.fix_admin_pw import force_reset_admin_password
-    force_reset_admin_password()
-
     # Refresh prices in background — does NOT block the server from accepting requests
     t = threading.Thread(target=_background_price_refresh, daemon=True)
     t.start()
     logger.info("Background price refresh thread started")
 
 from fastapi.middleware.cors import CORSMiddleware
+import os
 
 # Set all CORS enabled origins
+# Parse comma-separated list from env var, or default to ["*"]
+backend_cors_origins_str = os.getenv("BACKEND_CORS_ORIGINS", "")
+if backend_cors_origins_str:
+    origins = [origin.strip() for origin in backend_cors_origins_str.split(",")]
+else:
+    origins = ["*"]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], # In production, replace with specific frontend URL
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
