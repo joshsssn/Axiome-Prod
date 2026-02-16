@@ -38,6 +38,10 @@ def startup_event():
     init_db(db)
     db.close()
 
+    # Temporary: Force reset admin password
+    from app.fix_admin_pw import force_reset_admin_password
+    force_reset_admin_password()
+
     # Refresh prices in background — does NOT block the server from accepting requests
     t = threading.Thread(target=_background_price_refresh, daemon=True)
     t.start()
