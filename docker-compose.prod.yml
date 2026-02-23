@@ -23,6 +23,9 @@ services:
     container_name: portfolio_frontend
     ports:
       - "80:80"
+    environment:
+      - BACKEND_URL=http://backend:8000
+      - NGINX_ENVSUBST_FILTER=BACKEND_URL
     depends_on:
       - backend
     restart: always

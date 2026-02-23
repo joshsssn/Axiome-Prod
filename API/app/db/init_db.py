@@ -118,6 +118,22 @@ def _seed_default_portfolios(db: Session, owner_id: int) -> None:
     ]
 
     for pf_data in portfolios_data:
+        # 1. Ensure all instruments for this portfolio exist
+        for sym, qty, price in pf_data["positions"]:
+            instrument = db.query(Instrument).filter(Instrument.symbol == sym).first()
+            if not instrument:
+                instrument = Instrument(
+                    symbol=sym,
+                    name=sym,
+                    currency=pf_data["currency"],
+                    asset_class="stock",
+                )
+                db.add(instrument)
+        
+        # Flush instruments before creating portfolio/positions
+        db.flush()
+
+        # 2. Create the portfolio
         portfolio = Portfolio(
             name=pf_data["name"],
             description=pf_data["description"],
@@ -126,22 +142,10 @@ def _seed_default_portfolios(db: Session, owner_id: int) -> None:
             owner_id=owner_id,
         )
         db.add(portfolio)
-        db.flush()
+        db.flush() # Get portfolio.id
 
+        # 3. Create positions
         for sym, qty, price in pf_data["positions"]:
-            # Check if instrument exists, if not create it
-            instrument = db.query(Instrument).filter(Instrument.symbol == sym).first()
-            if not instrument:
-                instrument = Instrument(
-                    symbol=sym,
-                    name=sym, # Default name is symbol
-                    currency=pf_data["currency"],
-                    asset_class="stock", 
-                    # source="yahoo" # Not in model
-                )
-                db.add(instrument)
-                db.flush()
-
             pos = Position(
                 portfolio_id=portfolio.id,
                 instrument_symbol=sym,
@@ -151,6 +155,8 @@ def _seed_default_portfolios(db: Session, owner_id: int) -> None:
                 pricing_mode="market",
             )
             db.add(pos)
+        
+        db.flush()
 
     db.commit()
     print(f"Seeded {len(portfolios_data)} default portfolios for admin")
